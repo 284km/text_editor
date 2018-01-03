@@ -1,0 +1,223 @@
+#! /usr/bin/env ruby
+require 'io/console'
+
+CTRL_H = 8
+TAB = 9
+ENTER = 13
+CTRL_Q = 17
+CTRL_S = 19
+
+Row = Struct.new("Row", :chars, :render)
+Config = Struct.new("Config", :cx, :cy, :rowoff, :coloff, :screenrows, :screencols, :rows)
+E = Config.new
+
+def editorUpdateRow(row)
+  row.render = row.chars
+end
+
+def editorInsertRow(at, s)
+  return if at > E.rows.size
+  E.rows.insert(at, Row.new)
+  E.rows[at].chars = s
+  E.rows[at].render = ''
+  editorUpdateRow(E.rows[at])
+end
+
+def editorRowInsertChar(row, at, c)
+  if at > row.chars.size
+    padlen = at-row.chars.size
+    row.chars << ' ' * padlen
+  else
+    row.chars.insert(at, c.chr)
+    editorUpdateRow(row)
+  end
+end
+
+def editorRowAppendString(row, s)
+  row.chars << s
+  editorUpdateRow(row)
+end
+
+def editorRowDelChar(row, at)
+  return if row.chars.size <= at
+  row.chars.slice!(at)
+  editorUpdateRow(row)
+end
+
+def editorInsertChar(c)
+  filerow = E.rowoff+E.cy
+  filecol = E.coloff+E.cx
+  row = (filerow >= E.rows.size) ? nil : E.rows[filerow]
+  unless row
+    while E.rows.size <= filerow
+      editorInsertRow(E.rows.size,"")
+    end
+  end
+  row = E.rows[filerow]
+  editorRowInsertChar(row, filecol, c)
+  if E.cx == E.screencols-1
+    E.coloff += 1
+  else
+    E.cx += 1
+  end
+end
+
+def editorInsertNewline
+  filerow = E.rowoff+E.cy
+  filecol = E.coloff+E.cx
+  row = (filerow >= E.rows.size) ? nil : E.rows[filerow]
+  if !row
+    if filerow == E.rows.size
+      editorInsertRow(filerow,"")
+      fixcursor
+    end
+    return
+  end
+  filecol = row.chars.size if filecol >= row.chars.size
+  if filecol == 0
+    editorInsertRow(filerow, "")
+  else
+    cut = row.chars.slice!(filecol, (row.chars.size-filecol))
+    editorInsertRow(filerow+1, cut)
+    row = E.rows[filerow]
+    editorUpdateRow(row)
+  end
+  fixcursor
+end
+
+def fixcursor
+  if E.cy == E.screenrows-1
+    E.rowoff += 1
+  else
+    E.cy += 1
+  end
+  E.cx = 0
+  E.coloff = 0
+end
+
+def editorDelChar
+  filerow = E.rowoff+E.cy
+  filecol = E.coloff+E.cx
+  row = (filerow >= E.rows.size) ? nil : E.rows[filerow]
+
+  return if (!row || (filecol == 0 && filerow == 0))
+  if filecol == 0
+    filecol = E.rows[filerow-1].chars.size
+    E.rows[filerow-1].chars << row.chars
+    editorUpdateRow(row)
+    E.rows.delete(filerow) if (filerow < E.rows.size)
+    row = nil
+    if E.cy == 0
+      E.rowoff -= 1
+    else
+      E.cy -= 1
+    end
+    E.cx = filecol
+    if E.cx >= E.screencols
+      shift = (E.screencols-E.cx)+1
+      E.cx -= shift
+      E.coloff += shift
+    end
+  else
+    editorRowDelChar(row,filecol-1)
+    if E.cx == 0 && E.coloff > 0
+      E.coloff -= 1
+    else
+      E.cx -= 1
+    end
+  end
+  editorUpdateRow(row) if row
+end
+
+def filename
+  ARGV[0]
+end
+
+def run
+  E.cx = 0
+  E.cy = 0
+  E.rowoff = 0
+  E.coloff = 0
+  E.rows = []
+  E.screenrows, E.screencols = $stdout.winsize
+  E.screenrows -= 2
+
+  open(filename, "r") do |fp|
+    fp.each_line do |line|
+      at = E.rows.size
+      E.rows.insert(at, Row.new)
+      E.rows[at].chars = line.chomp
+      E.rows[at].render = E.rows[at].chars
+    end
+  end
+
+  $stdin.raw do |io|
+    while true
+      ab = ''
+      ab << "\x1b[?25l"
+      ab << "\x1b[H"
+      (0 ... E.screenrows).each do |y|
+        r = E.rows[E.rowoff+y]
+        len = r.render.size - E.coloff
+        if len > 0
+          len = E.screencols if len > E.screencols
+          ab << r.render[E.coloff, len]
+        end
+        ab << "\x1b[39m"
+        ab << "\x1b[0K"
+        ab << "\r\n"
+      end
+
+      ab << "\x1b[0K"
+      ab << "\x1b[7m"
+      status = sprintf("%.20s - %d lines", filename, E.rows.size)
+      rstatus = sprintf("%d/%d",E.rowoff+E.cy+1,E.rows.size)
+      len = status.size
+      len = E.screencols if len > E.screencols
+      ab << status[0, len]
+      rlen = rstatus.size
+      while len < E.screencols
+        if E.screencols - len == rlen
+          ab << rstatus[0, rlen]
+          break
+        else
+          ab << " "
+          len += 1 
+        end
+      end
+      ab << "\x1b[0m\r\n"
+      ab << "\x1b[0K"
+
+      cx = 1
+      filerow = E.rowoff+E.cy
+      row = (filerow >= E.rows.size) ? nil : E.rows[filerow]
+      if row
+        (E.coloff ... (E.cx+E.coloff)).each do |j|
+          cx += 1
+        end
+      end
+      buf = sprintf("\x1b[%d;%dH",E.cy+1,cx)
+      ab << buf
+      ab << "\x1b[?25h"
+      $stdout.write(ab)
+
+      c = io.readpartial(1).ord
+      case c
+      when ENTER
+        editorInsertNewline
+      when CTRL_Q
+        exit 0
+      when CTRL_S
+        open(filename, 'w', 0644) do |fd|
+          fd.write(E.rows.map(&:chars).join("\n"))
+        end
+      when CTRL_H
+        editorDelChar()
+      else
+        editorInsertChar(c)
+      end
+    end
+  end
+end
+
+run
